@@ -1,0 +1,5 @@
+The page table printout shows the valid PTEs in a process page table. Each indentation level corresponds to one level of the Sv39 three-level page table. A non-leaf PTE points to a lower-level page table, while a leaf PTE points to a physical page and contains permission bits such as PTE_R, PTE_W, PTE_X, and PTE_U.
+
+In the per-process kernel page table task, each process has its own kernel page table instead of sharing the global kernel page table while running in kernel mode. The process kernel page table maps the kernel text, kernel data, devices, trampoline, and the process's own kernel stack.
+
+For simplify copyin and copyinstr, user mappings are copied into the process kernel page table. This allows the kernel to access user virtual addresses through the current process's kernel page table instead of manually walking the user page table every time.

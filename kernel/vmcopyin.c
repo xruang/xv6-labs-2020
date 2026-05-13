@@ -15,11 +15,66 @@ static struct stats {
   int ncopyinstr;
 } stats;
 
-int
-statscopyin(char *buf, int sz) {
-  int n;
-  n = snprintf(buf, sz, "copyin: %d\n", stats.ncopyin);
-  n += snprintf(buf+n, sz, "copyinstr: %d\n", stats.ncopyinstr);
+static int
+appendint(char *buf, int sz, int n, int x)
+{
+  char tmp[16];
+  int i = 0;
+
+  if(sz <= 0)
+    return n;
+
+  if(x == 0){
+    if(n < sz - 1)
+      buf[n++] = '0';
+    buf[n] = 0;
+    return n;
+  }
+
+  while(x > 0){
+    tmp[i++] = '0' + x % 10;
+    x /= 10;
+  }
+
+  while(i > 0 && n < sz - 1)
+    buf[n++] = tmp[--i];
+
+  buf[n] = 0;
+  return n;
+}
+
+int 
+statscopyin(char *buf, int sz) 
+{
+  int n = 0;
+
+  if(sz <= 0)
+    return 0;
+
+  buf[0] = 0;
+
+  char *s1 = "copyin: ";
+  for(; *s1 && n < sz - 1; s1++)
+    buf[n++] = *s1;
+  buf[n] = 0;
+
+  n = appendint(buf, sz, n, stats.ncopyin);
+
+  if(n < sz - 1)
+    buf[n++] = '\n';
+  buf[n] = 0;
+
+  char *s2 = "copyinstr: ";
+  for(; *s2 && n < sz - 1; s2++)
+    buf[n++] = *s2;
+  buf[n] = 0;
+
+  n = appendint(buf, sz, n, stats.ncopyinstr);
+
+  if(n < sz - 1)
+    buf[n++] = '\n';
+  buf[n] = 0;
+
   return n;
 }
 
@@ -29,12 +84,15 @@ statscopyin(char *buf, int sz) {
 int
 copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
+  stats.ncopyin++;
+  
   struct proc *p = myproc();
 
   if (srcva >= p->sz || srcva+len >= p->sz || srcva+len < srcva)
     return -1;
   memmove((void *) dst, (void *)srcva, len);
-  stats.ncopyin++;   // XXX lock
+  
+
   return 0;
 }
 
@@ -45,10 +103,10 @@ copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
+ stats.ncopyinstr++;
   struct proc *p = myproc();
   char *s = (char *) srcva;
   
-  stats.ncopyinstr++;   // XXX lock
   for(int i = 0; i < max && srcva + i < p->sz; i++){
     dst[i] = s[i];
     if(s[i] == '\0')

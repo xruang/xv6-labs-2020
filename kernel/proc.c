@@ -34,12 +34,7 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      
   }
   kvminithart();
 }
@@ -85,6 +80,9 @@ allocpid() {
   return pid;
 }
 
+
+
+
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
@@ -121,6 +119,23 @@ found:
     return 0;
   }
 
+////// 新加部分 start //////
+
+  // 为新进程创建独立的内核页表，并将内核所需要的各种映射添加到新页表上
+  p->kernelpgtbl = kvminit_newpgtbl();
+  // printf("kernel_pagetable: %p\n", p->kernelpgtbl);
+
+  // 分配一个物理页，作为新进程的内核栈使用
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)0); // 将内核栈映射到固定的逻辑地址上
+  // printf("map krnlstack va: %p to pa: %p\n", va, pa);
+  kvmmap(p->kernelpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va; // 记录内核栈的逻辑地址，其实已经是固定的了，依然这样记录是为了避免需要修改其他部分 xv6 代码
+
+////// 新加部分 end //////
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +157,24 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  
+
+// 释放进程的内核栈
+  void *kstack_pa = (void *)kvmpa(p->kernelpgtbl, p->kstack);
+  // printf("trace: free kstack %p\n", kstack_pa);
+  kfree(kstack_pa);
+  p->kstack = 0;
+  
+  // 注意：此处不能使用 proc_freepagetable，因为其不仅会释放页表本身，还会把页表内所有的叶节点对应的物理页也释放掉。
+  // 这会导致内核运行所需要的关键物理页被释放，从而导致内核崩溃。
+  // 这里使用 kfree(p->kernelpgtbl) 也是不足够的，因为这只释放了**一级页表本身**，而不释放二级以及三级页表所占用的空间。
+  
+  // 递归释放进程独享的页表，释放页表本身所占用的空间，但**不释放页表指向的物理页**
+  kvm_free_kernelpgtbl(p->kernelpgtbl);
+  p->kernelpgtbl = 0;
+
+
+ 
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -150,6 +183,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
 }
 
 // Create a user page table for a given process,
@@ -220,7 +254,9 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
-
+ if( kvmcopymappings(p->pagetable, p->kernelpgtbl, 0, p->sz)<0)
+   panic("userinit: kvmcopymappings");
+ // 同步程序内存映射到进程内核页表中
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -238,16 +274,29 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint sz,newsz;
   struct proc *p = myproc();
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    newsz = uvmalloc(p->pagetable, sz, sz + n);
+    if(newsz == 0)
+      return -1;
+   
+      // 把新增的用户页映射同步到进程自己的内核页表
+    if(kvmcopymappings(p->pagetable, p->kernelpgtbl, sz, newsz - sz) < 0){
+      uvmdealloc(p->pagetable, newsz, sz);
       return -1;
     }
+
+    sz = newsz;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    
+    newsz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 从进程内核页表中删除对应的用户映射副本，不释放物理页
+    kvmdealloc(p->kernelpgtbl, sz, newsz);
+
+    sz = newsz;
   }
   p->sz = sz;
   return 0;
@@ -268,7 +317,9 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 ||
+ kvmcopymappings(np->pagetable, np->kernelpgtbl, 0, p->sz) < 0)   
+{
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -473,8 +524,15 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-        swtch(&c->context, &p->context);
 
+         // 切换到进程独立的内核页表
+        w_satp(MAKE_SATP(p->kernelpgtbl));
+        sfence_vma(); // 清除快表缓存
+              
+        swtch(&c->context, &p->context);
+         
+         // 切换回全局内核页表
+        kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;

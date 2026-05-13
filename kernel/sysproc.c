@@ -95,3 +95,31 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_statistics(void)
+{
+  uint64 addr;
+  int sz;
+  struct proc *p = myproc();
+  char buf[512];
+  int n;
+
+  if(argaddr(0, &addr) < 0)
+    return -1;
+  if(argint(1, &sz) < 0)
+    return -1;
+
+  if(sz <= 0)
+    return -1;
+
+  if(sz > sizeof(buf))
+    sz = sizeof(buf);
+
+  n = statscopyin(buf, sz);
+
+  if(copyout(p->pagetable, addr, buf, n) < 0)
+    return -1;
+
+  return n;
+}
