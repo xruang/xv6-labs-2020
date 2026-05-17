@@ -49,6 +49,18 @@ printint(int xx, int base, int sign)
     consputc(buf[i]);
 }
 
+// printf.c
+
+void backtrace() {
+  uint64 fp = r_fp();
+  while(fp != PGROUNDUP(fp)) { // 如果已经到达栈底
+    uint64 ra = *(uint64*)(fp - 8); // return address
+    printf("%p\n", ra);
+    fp = *(uint64*)(fp - 16); // previous fp
+  }
+}
+
+
 static void
 printptr(uint64 x)
 {
