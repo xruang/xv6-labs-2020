@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -311,7 +313,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -319,14 +320,15 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    if(*pte & PTE_W){
+    *pte = (*pte & ~PTE_W)| PTE_COW;
+     }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    
+    if(mappages(new, i, PGSIZE,(uint64)pa, flags) != 0){
       goto err;
     }
+        krefpage((void*)pa);
   }
   return 0;
 
@@ -357,6 +359,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
+    if(uvmcheckcowpage(dstva))
+        uvmcowcopy(dstva);
+
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
@@ -439,4 +444,68 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+// kernel/vm.c
+// 检查一个地址指向的页是否是懒复制页
+int uvmcheckcowpage(uint64 va) {
+  pte_t *pte;
+  struct proc *p = myproc();
+  
+  return va < p->sz // 在进程内存范围内
+    && ((pte = walk(p->pagetable, va, 0))!=0)
+    && (*pte & PTE_V) // 页表项存在
+    && (*pte & PTE_U)
+    && (*pte & PTE_COW); // 页是一个懒复制
+}
+
+int
+uvmcowcopy(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  va = PGROUNDDOWN(va);
+
+  if(va >= p->sz)
+    return -1;
+
+  if((pte = walk(p->pagetable, va, 0)) == 0)
+    return -1;
+
+  if((*pte & PTE_V) == 0)
+    return -1;
+
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  memmove(mem, (char*)pa, PGSIZE);
+
+  /*
+   * 减少旧物理页引用计数。
+   * 如果没有其他进程引用，kfree 会真正释放它；
+   * 如果还有其他进程引用，只是引用计数减一。
+   */
+  kfree((void*)pa);
+
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  /*
+   * 不要 mappages()，否则容易 panic: remap。
+   * 直接修改已有 PTE。
+   */
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  return 0;
 }

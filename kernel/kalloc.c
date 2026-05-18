@@ -9,6 +9,12 @@
 #include "riscv.h"
 #include "defs.h"
 
+
+#define PGREF_MAX_ENTRIES ((PHYSTOP - KERNBASE) / PGSIZE)
+#define PA2PGREF(pa) pageref[(((uint64)(pa)) - KERNBASE) / PGSIZE]
+
+struct spinlock pgreflock;
+int pageref[PGREF_MAX_ENTRIES];
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -27,6 +33,7 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&pgreflock,"pgref");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -51,15 +58,22 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+   acquire(&pgreflock);
+  if(--PA2PGREF(pa) <= 0) {
+    // 当页面的引用计数小于等于 0 的时候，释放页面
 
-  r = (struct run*)pa;
+    // Fill with junk to catch dangling refs.
+    // pa will be memset multiple times if race-condition occurred.
+    memset(pa, 1, PGSIZE);
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+    r = (struct run*)pa;
+
+    acquire(&kmem.lock);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    release(&kmem.lock);
+  }
+  release(&pgreflock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -76,7 +90,45 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    // 新分配的物理页的引用计数为 1
+    // (这里无需加锁)
+    PA2PGREF(r) = 1;
+  }
+
   return (void*)r;
 }
+
+// 当引用已经小于等于 1 时，不创建和复制到新的物理页，而是直接返回该页本身
+void *kcopy_n_deref(void *pa) {
+  acquire(&pgreflock);
+
+  if(PA2PGREF(pa) <= 1) { // 只有 1 个引用，无需复制
+    release(&pgreflock);
+    return pa;
+  }
+
+  // 分配新的内存页，并复制旧页中的数据到新页
+  uint64 newpa = (uint64)kalloc();
+  if(newpa == 0) {
+    release(&pgreflock);
+    return 0; // out of memory
+  }
+  memmove((void*)newpa, (void*)pa, PGSIZE);
+
+  // 旧页的引用减 1
+  PA2PGREF(pa)--;
+
+  release(&pgreflock);
+  return (void*)newpa;
+}
+
+// 为 pa 的引用计数增加 1
+void krefpage(void *pa) {
+  acquire(&pgreflock);
+  PA2PGREF(pa)++;
+  release(&pgreflock);
+}
+
+
