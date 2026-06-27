@@ -1,0 +1,15 @@
+1. Function arguments are passed in registers a0-a7. In main's call to printf, the value 13 is passed in register a2.
+
+2. There is no actual call to f or g in the assembly. The compiler inlined f() and g(), so f(8)+1 is computed directly as 12.
+
+3. The address of printf can be found in user/call.asm at the label <printf>. In my build it is the address shown next to <printf>.
+
+4. After the jalr to printf in main, ra contains the address of the instruction immediately after the call to printf. In the typical call.asm this is main+0x1c or the next instruction address after jalr.
+
+5. The output is:
+HE110 World
+
+57616 is 0xE110. The integer i = 0x00646c72 is stored little-endian in memory as bytes 72 6c 64 00, which is the string "rld". Therefore "H%x Wo%s" prints "HE110 World".
+If RISC-V were big-endian, i should be set to 0x726c6400 to produce the same string. The value 57616 would not need to change.
+
+6. For printf("x=%d y=%d", 3), the value after y= is an unpredictable garbage value. The format string asks for two integer arguments, but only one was provided, so printf reads whatever value happens to be in the next argument location/register.
