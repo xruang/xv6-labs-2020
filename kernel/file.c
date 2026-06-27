@@ -180,3 +180,45 @@ filewrite(struct file *f, uint64 addr, int n)
   return ret;
 }
 
+int
+filereadat(struct file *f, uint64 addr, int n, uint off)
+{
+  int r;
+
+  if(f->readable == 0 || f->type != FD_INODE)
+    return -1;
+
+  ilock(f->ip);
+  r = readi(f->ip, 0, addr, off, n);
+  iunlock(f->ip);
+  return r;
+}
+
+int
+filewriteat(struct file *f, uint64 addr, int n, uint off)
+{
+  int i, r;
+
+  if(f->writable == 0 || f->type != FD_INODE)
+    return -1;
+
+  // A single log transaction cannot modify an arbitrary number of blocks.
+  int max = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+
+  for(i = 0; i < n; i += r){
+    int n1 = n - i;
+    if(n1 > max)
+      n1 = max;
+
+    begin_op();
+    ilock(f->ip);
+    r = writei(f->ip, 0, addr + i, off + i, n1);
+    iunlock(f->ip);
+    end_op();
+
+    if(r != n1)
+      break;
+  }
+
+  return i == n ? n : -1;
+}

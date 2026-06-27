@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -484,3 +485,111 @@ sys_pipe(void)
   }
   return 0;
 }
+
+
+static uint64
+mmap_address(struct proc *p, uint64 length)
+{
+  uint64 addr = MMAPBASE;
+
+  if(length == 0 || length > TRAPFRAME - MMAPBASE)
+    return 0;
+
+  // Find the first non-overlapping address. Repeating the scan handles an
+  // unsorted VMA table.
+  for(;;){
+    int moved = 0;
+
+    for(int i = 0; i < NVMA; i++){
+      struct vma *v = &p->vmas[i];
+      if(!v->valid)
+        continue;
+
+      uint64 vend = v->addr + v->length;
+      if(addr < vend && addr + length > v->addr){
+        addr = PGROUNDUP(vend);
+        moved = 1;
+        break;
+      }
+    }
+
+    if(!moved)
+      break;
+    if(addr >= TRAPFRAME || length > TRAPFRAME - addr)
+      return 0;
+  }
+
+  if(addr >= TRAPFRAME || length > TRAPFRAME - addr)
+    return 0;
+  return addr;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 requested;
+  int length, prot, flags, fd, offset;
+  struct file *f;
+
+  if(argaddr(0, &requested) < 0 ||
+     argint(1, &length) < 0 ||
+     argint(2, &prot) < 0 ||
+     argint(3, &flags) < 0 ||
+     argfd(4, &fd, &f) < 0 ||
+     argint(5, &offset) < 0)
+    return (uint64)-1;
+
+  if(requested != 0 || length <= 0 || offset < 0 ||
+     offset % PGSIZE != 0)
+    return (uint64)-1;
+
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return (uint64)-1;
+
+  // The kernel must be able to populate a page from the file even when the
+  // user mapping is write-only.
+  if(!f->readable)
+    return (uint64)-1;
+
+  if((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable)
+    return (uint64)-1;
+
+  struct proc *p = myproc();
+  struct vma *slot = 0;
+  for(int i = 0; i < NVMA; i++){
+    if(!p->vmas[i].valid){
+      slot = &p->vmas[i];
+      break;
+    }
+  }
+  if(slot == 0)
+    return (uint64)-1;
+
+  uint64 maplen = PGROUNDUP((uint64)length);
+  uint64 addr = mmap_address(p, maplen);
+  if(addr == 0)
+    return (uint64)-1;
+
+  slot->valid = 1;
+  slot->addr = addr;
+  slot->length = maplen;
+  slot->prot = prot;
+  slot->flags = flags;
+  slot->offset = offset;
+  slot->file = filedup(f);
+
+  return addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0 || length <= 0)
+    return -1;
+
+  return vma_unmap(myproc(), addr, (uint64)length);
+}
+

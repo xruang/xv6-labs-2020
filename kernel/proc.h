@@ -18,6 +18,19 @@ struct context {
   uint64 s11;
 };
 
+#define NVMA 16
+
+struct vma {
+  int valid;
+  uint64 addr;       // page-aligned start address
+  uint64 length;     // page-rounded mapping length
+  int prot;
+  int flags;
+  uint64 offset;     // file offset corresponding to addr
+  struct file *file; // filedup() reference owned by this VMA
+};
+
+
 // Per-CPU state.
 struct cpu {
   struct proc *proc;          // The process running on this cpu, or null.
@@ -103,4 +116,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  struct vma vmas[NVMA];
 };

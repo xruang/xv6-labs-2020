@@ -3,8 +3,12 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -134,6 +138,11 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+   for(int i = 0; i < NVMA; i++){
+    p->vmas[i].valid = 0;
+    p->vmas[i].file = 0;
+  }
+
   return p;
 }
 
@@ -260,6 +269,172 @@ growproc(int n)
   return 0;
 }
 
+static struct vma*
+vma_find(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(v->valid && va >= v->addr && va < v->addr + v->length)
+      return v;
+  }
+  return 0;
+}
+
+int
+vma_pagefault(struct proc *p, uint64 va, uint64 scause)
+{
+  struct vma *v = vma_find(p, va);
+  if(v == 0)
+    return -1;
+
+  // 12: instruction page fault
+  // 13: load page fault
+  // 15: store/AMO page fault
+  if(scause == 12 && (v->prot & PROT_EXEC) == 0)
+    return -1;
+  if(scause == 13 && (v->prot & PROT_READ) == 0)
+    return -1;
+  if(scause == 15 && (v->prot & PROT_WRITE) == 0)
+    return -1;
+
+  uint64 a = PGROUNDDOWN(va);
+  if(a < v->addr || a >= v->addr + v->length)
+    return -1;
+
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  uint64 remain = v->addr + v->length - a;
+  int n = remain < PGSIZE ? remain : PGSIZE;
+  uint64 fileoff = v->offset + (a - v->addr);
+
+  // A short read at EOF is valid; the rest of the page remains zero.
+  if(filereadat(v->file, (uint64)mem, n, fileoff) < 0){
+    kfree(mem);
+    return -1;
+  }
+
+  int perm = PTE_U;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  // RISC-V does not define a valid writable-but-not-readable leaf PTE.
+  if(perm & PTE_W)
+    perm |= PTE_R;
+
+  if(mappages(p->pagetable, a, PGSIZE, (uint64)mem, perm) != 0){
+    kfree(mem);
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+vma_unmap_pages(struct proc *p, struct vma *v,
+                uint64 start, uint64 length, int force)
+{
+  uint64 end = start + length;
+  int error = 0;
+
+  // First perform write-back. This keeps an ordinary munmap atomic with
+  // respect to write errors: pages are not removed unless write-back succeeds.
+  if((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE)){
+    for(uint64 a = start; a < end; a += PGSIZE){
+      pte_t *pte = walk(p->pagetable, a, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue; // the lazy page was never faulted in
+
+      int n = end - a < PGSIZE ? end - a : PGSIZE;
+      uint64 pa = PTE2PA(*pte);
+      uint64 fileoff = v->offset + (a - v->addr);
+
+      if(filewriteat(v->file, pa, n, fileoff) < 0){
+        error = -1;
+        if(!force)
+          return -1;
+      }
+    }
+  }
+
+  // uvmunmap() in the original xv6 panics on an absent PTE, so skip pages
+  // that were never populated.
+  for(uint64 a = start; a < end; a += PGSIZE){
+    pte_t *pte = walk(p->pagetable, a, 0);
+    if(pte != 0 && (*pte & PTE_V))
+      uvmunmap(p->pagetable, a, 1, 1);
+  }
+
+  return error;
+}
+
+int
+vma_unmap(struct proc *p, uint64 addr, uint64 length)
+{
+  if(length == 0 || addr % PGSIZE != 0)
+    return -1;
+
+  length = PGROUNDUP(length);
+  if(addr + length < addr)
+    return -1;
+
+  struct vma *v = vma_find(p, addr);
+  if(v == 0)
+    return -1;
+
+  uint64 oldend = v->addr + v->length;
+  uint64 end = addr + length;
+  if(end > oldend)
+    return -1;
+
+  // The lab guarantees no request punches a hole in the middle. Reject it
+  // explicitly so that VMA metadata cannot become inconsistent.
+  if(addr != v->addr && end != oldend)
+    return -1;
+
+  if(vma_unmap_pages(p, v, addr, length, 0) < 0)
+    return -1;
+
+  if(addr == v->addr && end == oldend){
+    struct file *f = v->file;
+    memset(v, 0, sizeof(*v));
+    fileclose(f);
+  } else if(addr == v->addr){
+    uint64 delta = end - v->addr;
+    v->addr = end;
+    v->length -= delta;
+    v->offset += delta;
+  } else {
+    // Removing a suffix.
+    v->length = addr - v->addr;
+  }
+
+  return 0;
+}
+
+void
+vma_unmap_all(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(!v->valid)
+      continue;
+
+    // exit/exec must release all pages even if a disk write fails.
+    vma_unmap_pages(p, v, v->addr, v->length, 1);
+    struct file *f = v->file;
+    memset(v, 0, sizeof(*v));
+    fileclose(f);
+  }
+}
+
+
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
@@ -294,7 +469,17 @@ fork(void)
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
-  np->cwd = idup(p->cwd);
+  
+// Copy mmap metadata. Mapped physical pages live above p->sz, so uvmcopy()
+  // does not copy them. Parent and child fault in their own pages lazily.
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].valid){
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].file = filedup(p->vmas[i].file);
+    }
+  } 
+
+ np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -343,6 +528,8 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+ vma_unmap_all(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
