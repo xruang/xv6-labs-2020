@@ -287,21 +287,31 @@ uint64
 sys_open(void)
 {
   char path[MAXPATH];
+  char target[MAXPATH];
   int fd, omode;
+  int n, depth;
   struct file *f;
   struct inode *ip;
-  int n;
 
-  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+  if((n = argstr(0, path, MAXPATH)) < 0 ||
+     argint(1, &omode) < 0)
     return -1;
 
   begin_op();
 
   if(omode & O_CREATE){
-    ip = create(path, T_FILE, 0, 0);
-    if(ip == 0){
-      end_op();
-      return -1;
+    /*
+     * 先查找现有文件，使 O_CREATE 打开已有符号链接时
+     * 仍然可以根据 O_NOFOLLOW 决定是否跟随。
+     */
+    if((ip = namei(path)) != 0){
+      ilock(ip);
+    } else {
+      ip = create(path, T_FILE, 0, 0);
+      if(ip == 0){
+        end_op();
+        return -1;
+      }
     }
   } else {
     if((ip = namei(path)) == 0){
@@ -309,22 +319,76 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+  }
+
+  /*
+   * 默认跟随符号链接。
+   * O_NOFOLLOW 表示打开符号链接 inode 本身。
+   */
+  if((omode & O_NOFOLLOW) == 0){
+    for(depth = 0; ip->type == T_SYMLINK; depth++){
+      /*
+       * 最多跟随 10 层，防止：
+       *
+       * a -> b
+       * b -> a
+       */
+      if(depth >= 10){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      if(ip->size == 0 || ip->size > MAXPATH){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      memset(target, 0, sizeof(target));
+
+      if(readi(ip, 0, (uint64)target, 0, ip->size)
+          != ip->size){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      // 即使符号链接内容损坏，也保证字符串以 '\0' 结束。
+      target[MAXPATH - 1] = '\0';
+
       iunlockput(ip);
-      end_op();
-      return -1;
+
+      if((ip = namei(target)) == 0){
+        end_op();
+        return -1;
+      }
+
+      ilock(ip);
     }
   }
 
-  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+  // 目录只能以只读方式打开。
+  if(ip->type == T_DIR && omode != O_RDONLY){
     iunlockput(ip);
     end_op();
     return -1;
   }
 
-  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+  // 检查设备号是否合法。
+  if(ip->type == T_DEVICE &&
+     (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  // 分配内核 file 对象和当前进程的文件描述符。
+  if((f = filealloc()) == 0 ||
+     (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
+
     iunlockput(ip);
     end_op();
     return -1;
@@ -337,13 +401,14 @@ sys_open(void)
     f->type = FD_INODE;
     f->off = 0;
   }
+
   f->ip = ip;
   f->readable = !(omode & O_WRONLY);
-  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+  f->writable = (omode & O_WRONLY) ||
+                (omode & O_RDWR);
 
-  if((omode & O_TRUNC) && ip->type == T_FILE){
+  if((omode & O_TRUNC) && ip->type == T_FILE)
     itrunc(ip);
-  }
 
   iunlock(ip);
   end_op();
@@ -482,5 +547,37 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+  int len;
+
+  if(argstr(0, target, MAXPATH) < 0 ||
+     argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+
+  len = strlen(target) + 1;
+
+  if(writei(ip, 0, (uint64)target, 0, len) != len){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
   return 0;
 }

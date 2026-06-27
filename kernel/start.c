@@ -70,8 +70,8 @@ timerinit()
   // scratch[4] : address of CLINT MTIMECMP register.
   // scratch[5] : desired interval (in cycles) between timer interrupts.
   uint64 *scratch = &mscratch0[32 * id];
-  scratch[4] = CLINT_MTIMECMP(id);
-  scratch[5] = interval;
+  scratch[3] = CLINT_MTIMECMP(id);
+  scratch[4] = interval;
   w_mscratch((uint64)scratch);
 
   // set the machine-mode trap handler.

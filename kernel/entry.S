@@ -22,4 +22,4 @@ _entry:
         call start
 
 spin:
-        j spin
+       j spin
